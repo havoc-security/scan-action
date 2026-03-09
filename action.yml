@@ -1,0 +1,91 @@
+name: 'HAVOC Security Scan'
+description: 'Framework-aware adversarial security scanning for web applications'
+author: 'HAVOC Security'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  api-key:
+    description: 'HAVOC API key (from havoc.cloud dashboard)'
+    required: true
+  path:
+    description: 'Path to scan (default: current directory)'
+    required: false
+    default: '.'
+  framework:
+    description: 'Framework to scan for (auto-detected if not specified)'
+    required: false
+  fail-on:
+    description: 'Minimum severity to fail the check (critical, high, medium, low)'
+    required: false
+    default: 'high'
+  cloud-url:
+    description: 'HAVOC Cloud URL (for self-hosted instances)'
+    required: false
+    default: 'https://havoc.cloud'
+
+outputs:
+  summary:
+    description: 'Scan summary (JSON)'
+  grade:
+    description: 'Security grade (A-F)'
+  findings-count:
+    description: 'Total number of findings'
+  critical-count:
+    description: 'Number of critical findings'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install HAVOC CLI
+      shell: bash
+      run: npm install -g @havoc-security/cli
+
+    - name: Run HAVOC Scan
+      shell: bash
+      id: scan
+      env:
+        HAVOC_API_KEY: ${{ inputs.api-key }}
+        HAVOC_CLOUD_URL: ${{ inputs.cloud-url }}
+      run: |
+        ARGS="${{ inputs.path }}"
+        if [ -n "${{ inputs.framework }}" ]; then
+          ARGS="$ARGS --framework ${{ inputs.framework }}"
+        fi
+        ARGS="$ARGS --fail-on ${{ inputs.fail-on }}"
+        ARGS="$ARGS --format json --output /tmp/havoc-results.json"
+        
+        havoc scan $ARGS || true
+        
+        if [ -f /tmp/havoc-results.json ]; then
+          echo "summary=$(cat /tmp/havoc-results.json | jq -c .)" >> $GITHUB_OUTPUT
+          echo "grade=$(cat /tmp/havoc-results.json | jq -r '.grade // "unknown"')" >> $GITHUB_OUTPUT
+          echo "findings-count=$(cat /tmp/havoc-results.json | jq -r '.totalFindings // 0')" >> $GITHUB_OUTPUT
+          echo "critical-count=$(cat /tmp/havoc-results.json | jq -r '.criticalCount // 0')" >> $GITHUB_OUTPUT
+        fi
+
+    - name: HAVOC Scan Summary
+      shell: bash
+      if: always()
+      run: |
+        echo "## 🔴 HAVOC Security Scan Results" >> $GITHUB_STEP_SUMMARY
+        if [ -f /tmp/havoc-results.json ]; then
+          GRADE=$(cat /tmp/havoc-results.json | jq -r '.grade // "N/A"')
+          TOTAL=$(cat /tmp/havoc-results.json | jq -r '.totalFindings // 0')
+          CRITICAL=$(cat /tmp/havoc-results.json | jq -r '.criticalCount // 0')
+          HIGH=$(cat /tmp/havoc-results.json | jq -r '.highCount // 0')
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Grade | **$GRADE** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Findings | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| High | $HIGH |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "No results file generated." >> $GITHUB_STEP_SUMMARY
+        fi
