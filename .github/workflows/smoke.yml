@@ -1,0 +1,121 @@
+# Proves the action actually runs. The published v1 was broken for months
+# precisely because nothing here exercised it: it invoked the CLI with a flag
+# the CLI rejects, swallowed the error, set no outputs, and could never fail a
+# build. Each assertion below corresponds to one of those failures.
+name: Smoke test
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # The action installs the CLI at run time, so a CLI release can break it
+    # with no commit here. Catch that weekly rather than from a bug report.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  blocking:
+    name: A high finding fails the build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        continue-on-error: true
+        with:
+          path: tests/fixtures/vulnerable
+
+      - name: Assert the step failed and the outputs are populated
+        env:
+          OUTCOME: ${{ steps.scan.outcome }}
+          GRADE: ${{ steps.scan.outputs.grade }}
+          FINDINGS: ${{ steps.scan.outputs.findings-count }}
+          HIGH: ${{ steps.scan.outputs.high-count }}
+          AUTHZ: ${{ steps.scan.outputs.authz-coverage-percent }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}
+          RESULTS: ${{ steps.scan.outputs.results-path }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # fail-on must be able to fail a build. v1 could not.
+          [ "$OUTCOME" = "failure" ] || fail "expected the scan step to fail on a high finding, got '$OUTCOME'"
+
+          # Outputs must be set at all. v1 set none.
+          [ -n "$GRADE" ] && [ "$GRADE" != "unknown" ] || fail "grade was not set (got '$GRADE')"
+          [ "$HIGH" -ge 1 ] || fail "expected at least one high finding, got '$HIGH'"
+          [ "$FINDINGS" -ge "$HIGH" ] || fail "findings-count ($FINDINGS) < high-count ($HIGH)"
+          [ "$AUTHZ" = "0" ] || fail "expected 0% authorization coverage on the fixture, got '$AUTHZ'"
+
+          # summary must be real JSON carrying the same numbers.
+          echo "$SUMMARY" | jq -e . > /dev/null || fail "summary was not valid JSON"
+          IN_SUMMARY=$(echo "$SUMMARY" | jq -r '.findings | length')
+          [ "$IN_SUMMARY" = "$FINDINGS" ] || fail "summary has $IN_SUMMARY findings, findings-count says $FINDINGS"
+
+          # results-path must point at the full document.
+          [ -s "$RESULTS" ] || fail "results-path '$RESULTS' is missing or empty"
+          jq -e '.findings | length > 0' "$RESULTS" > /dev/null || fail "results-path holds no findings"
+
+          echo "blocking case OK — grade $GRADE, $FINDINGS findings, $HIGH high"
+
+  clean:
+    name: Findings below the threshold do not fail the build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        with:
+          path: tests/fixtures/clean
+
+      - name: Assert it passed and still reported
+        env:
+          GRADE: ${{ steps.scan.outputs.grade }}
+          HIGH: ${{ steps.scan.outputs.high-count }}
+          CRITICAL: ${{ steps.scan.outputs.critical-count }}
+          AUTHZ: ${{ steps.scan.outputs.authz-coverage-percent }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # Reaching this step at all means the scan exited 0.
+          [ "$HIGH" = "0" ] || fail "fixture should have no high findings, got '$HIGH'"
+          [ "$CRITICAL" = "0" ] || fail "fixture should have no critical findings, got '$CRITICAL'"
+          [ -n "$GRADE" ] && [ "$GRADE" != "unknown" ] || fail "grade was not set (got '$GRADE')"
+          # The fixture has no controller actions, so coverage is vacuously 100%
+          # — this asserts the null authorizationCoverage branch is handled.
+          [ "$AUTHZ" = "100" ] || fail "expected 100% coverage for a fixture with no actions, got '$AUTHZ'"
+          echo "$SUMMARY" | jq -e . > /dev/null || fail "summary was not valid JSON"
+
+          echo "clean case OK — grade $GRADE, no high or critical findings"
+
+  pinned:
+    name: An explicit cli-version is honoured
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        continue-on-error: true
+        with:
+          path: tests/fixtures/vulnerable
+          cli-version: '0.4.1'
+
+      - name: Assert the pinned CLI ran
+        env:
+          OUTCOME: ${{ steps.scan.outcome }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$OUTCOME" = "failure" ] || fail "expected a failure on the vulnerable fixture, got '$OUTCOME'"
+          VERSION=$(echo "$SUMMARY" | jq -r '.metadata.scannerVersion // "missing"')
+          [ "$VERSION" != "missing" ] || fail "no scannerVersion in the result"
+          echo "pinned case OK — scanner $VERSION"

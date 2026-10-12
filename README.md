@@ -3,8 +3,8 @@
 Framework-aware adversarial security scanning for **Laravel** applications. Break your code before attackers do.
 
 The action installs [`@havoc-security/cli`](https://www.npmjs.com/package/@havoc-security/cli)
-and scans your checkout on the runner. It needs no account and no API key — a
-key is only required if you want results synced to a HAVOC Cloud dashboard.
+and scans your checkout on the runner. It needs no account, no API key and no
+network calls of its own: nothing about your code leaves the runner.
 
 ## Usage
 
@@ -32,14 +32,6 @@ jobs:
         if: always()
 ```
 
-Syncing to a dashboard:
-
-```yaml
-      - uses: havoc-security/scan-action@v1
-        with:
-          api-key: ${{ secrets.HAVOC_API_KEY }}
-```
-
 Keeping the full result:
 
 ```yaml
@@ -56,12 +48,12 @@ Keeping the full result:
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `api-key` | HAVOC API key. Only needed to sync results to HAVOC Cloud. | ❌ | — |
+| `api-key` | **Reserved — not yet implemented.** Results are not uploaded anywhere. Leave unset. | ❌ | — |
 | `path` | Path to scan | ❌ | `.` |
 | `framework` | Framework to analyse. Laravel is the only implemented value. | ❌ | `laravel` |
 | `fail-on` | Minimum severity that fails the build (`critical`, `high`, `medium`, `low`) | ❌ | `high` |
 | `cli-version` | Version of `@havoc-security/cli` to install | ❌ | `latest` |
-| `cloud-url` | HAVOC Cloud URL (for self-hosted instances) | ❌ | `https://havoc.cloud` |
+| `cloud-url` | **Reserved — not yet implemented.** Has no effect. | ❌ | `https://havoc.cloud` |
 
 ### Outputs
 
@@ -87,11 +79,16 @@ blocking.
 
 ## Getting started
 
-Nothing to configure — add the action and push. To keep scan history, grades
-over time and AI-assisted triage, sign up at [havoc.cloud](https://havoc.cloud),
-create an API key, store it as the `HAVOC_API_KEY` repository secret and pass it
-as `api-key`.
+Nothing to configure — add the action and push. There is no account to create
+and no key to store.
 
+The `api-key` and `cloud-url` inputs are accepted but **do nothing today**: no
+published version of the CLI reads them and the scan makes no network calls.
+They are declared so that workflows written against earlier versions, which
+documented `api-key` as required, keep running without a warning. Uploading
+results to a dashboard is not implemented; this README will say so when it is.
+
+More about the project: [havoc.cloud](https://havoc.cloud).
 Questions: support@havoc.cloud
 
 ## License

@@ -7,7 +7,13 @@ branding:
 
 inputs:
   api-key:
-    description: 'HAVOC API key (from the havoc.cloud dashboard). Only needed to sync results to HAVOC Cloud; the scan itself runs locally.'
+    # RESERVED, NOT YET IMPLEMENTED. Declared so existing workflows that pass it
+    # do not warn, and exported below, but no published CLI reads it: there is
+    # no HAVOC_API_KEY reference and no HTTP client anywhere in
+    # @havoc-security/cli or @havoc-security/scanner (checked in source and in
+    # the published 0.4.1 tarball). The scan is entirely local. Do not advertise
+    # cloud sync until an upload path exists.
+    description: 'RESERVED — not yet implemented. Results are not uploaded anywhere; the scan runs entirely on the runner. Leave unset.'
     required: false
   path:
     description: 'Path to scan'
@@ -22,7 +28,8 @@ inputs:
     required: false
     default: 'high'
   cloud-url:
-    description: 'HAVOC Cloud URL (for self-hosted instances)'
+    # RESERVED — see api-key.
+    description: 'RESERVED — not yet implemented. Has no effect.'
     required: false
     default: 'https://havoc.cloud'
   cli-version:
@@ -32,7 +39,7 @@ inputs:
 
 outputs:
   summary:
-    description: 'Full scan result as compact JSON. Omits the findings array on very large results; read results-path for the complete document.'
+    description: 'Full scan result as compact JSON. Omits the findings array when it would not fit in a step output; read results-path for the complete document.'
     value: ${{ steps.scan.outputs.summary }}
   results-path:
     description: 'Path to the complete JSON result on the runner, for uploading as an artifact.'
@@ -99,14 +106,18 @@ runs:
 
         echo "results-path=$RESULTS" >> "$GITHUB_OUTPUT"
 
-        # A step output is size-capped, and a large repo's findings array can
-        # exceed it. Over the threshold, publish the result without findings
-        # and point consumers at results-path for the whole document.
-        SUMMARY_LIMIT=524288
-        if [ "$(wc -c < "$RESULTS")" -le "$SUMMARY_LIMIT" ]; then
-          echo "summary=$(jq -c . "$RESULTS")" >> "$GITHUB_OUTPUT"
+        # Step outputs are size-capped (GitHub documents ~1 MB, counted in
+        # UTF-16, for everything a job sets). Measure the COMPACT value, not
+        # the pretty file the CLI writes, and keep well clear of the cap so the
+        # seven other outputs below still fit. Over the threshold, publish the
+        # result without findings and point consumers at results-path.
+        SUMMARY_LIMIT=262144
+        COMPACT=/tmp/havoc-results.compact.json
+        jq -c . "$RESULTS" > "$COMPACT"
+        if [ "$(wc -c < "$COMPACT")" -le "$SUMMARY_LIMIT" ]; then
+          echo "summary=$(cat "$COMPACT")" >> "$GITHUB_OUTPUT"
         else
-          echo "::warning::Scan result exceeds the step-output limit; the summary output omits findings. Use results-path."
+          echo "::warning::Scan result exceeds $SUMMARY_LIMIT bytes; the summary output omits findings. Use results-path for the full document."
           echo "summary=$(jq -c 'del(.findings) + {findingsOmitted: (.findings | length)}' "$RESULTS")" >> "$GITHUB_OUTPUT"
         fi
 
