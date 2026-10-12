@@ -1,5 +1,5 @@
 name: 'HAVOC Security Scan'
-description: 'Framework-aware adversarial security scanning for web applications'
+description: 'Framework-aware adversarial security scanning for Laravel applications'
 author: 'HAVOC Security'
 branding:
   icon: 'shield'
@@ -7,33 +7,54 @@ branding:
 
 inputs:
   api-key:
-    description: 'HAVOC API key (from havoc.cloud dashboard)'
-    required: true
+    description: 'HAVOC API key (from the havoc.cloud dashboard). Only needed to sync results to HAVOC Cloud; the scan itself runs locally.'
+    required: false
   path:
-    description: 'Path to scan (default: current directory)'
+    description: 'Path to scan'
     required: false
     default: '.'
   framework:
-    description: 'Framework to scan for (auto-detected if not specified)'
+    description: 'Framework to analyse. Laravel is the only implemented value.'
     required: false
+    default: 'laravel'
   fail-on:
-    description: 'Minimum severity to fail the check (critical, high, medium, low)'
+    description: 'Minimum severity that fails the build (critical, high, medium, low)'
     required: false
     default: 'high'
   cloud-url:
     description: 'HAVOC Cloud URL (for self-hosted instances)'
     required: false
     default: 'https://havoc.cloud'
+  cli-version:
+    description: 'Version of @havoc-security/cli to install. Pin this for reproducible runs.'
+    required: false
+    default: 'latest'
 
 outputs:
   summary:
-    description: 'Scan summary (JSON)'
+    description: 'Full scan result as compact JSON. Omits the findings array on very large results; read results-path for the complete document.'
+    value: ${{ steps.scan.outputs.summary }}
+  results-path:
+    description: 'Path to the complete JSON result on the runner, for uploading as an artifact.'
+    value: ${{ steps.scan.outputs.results-path }}
   grade:
     description: 'Security grade (A-F)'
+    value: ${{ steps.scan.outputs.grade }}
   findings-count:
     description: 'Total number of findings'
+    value: ${{ steps.scan.outputs.findings-count }}
   critical-count:
     description: 'Number of critical findings'
+    value: ${{ steps.scan.outputs.critical-count }}
+  high-count:
+    description: 'Number of high-severity findings'
+    value: ${{ steps.scan.outputs.high-count }}
+  authz-coverage-percent:
+    description: 'Authorization coverage: controller actions with a detectable check'
+    value: ${{ steps.scan.outputs.authz-coverage-percent }}
+  route-auth-percent:
+    description: 'Route-level AUTHENTICATION percentage (not the headline metric)'
+    value: ${{ steps.scan.outputs.route-auth-percent }}
 
 runs:
   using: 'composite'
@@ -45,47 +66,87 @@ runs:
 
     - name: Install HAVOC CLI
       shell: bash
-      run: npm install -g @havoc-security/cli
+      run: npm install -g "@havoc-security/cli@${{ inputs.cli-version }}"
 
-    - name: Run HAVOC Scan
-      shell: bash
+    - name: Run HAVOC scan
       id: scan
+      shell: bash
       env:
         HAVOC_API_KEY: ${{ inputs.api-key }}
         HAVOC_CLOUD_URL: ${{ inputs.cloud-url }}
       run: |
-        ARGS="${{ inputs.path }}"
-        if [ -n "${{ inputs.framework }}" ]; then
-          ARGS="$ARGS --framework ${{ inputs.framework }}"
+        set -o pipefail
+        RESULTS=/tmp/havoc-results.json
+
+        # The CLI writes JSON to stdout and diagnostics to stderr. There is no
+        # --output flag; passing one makes Commander exit before it scans.
+        set +e
+        havoc scan "${{ inputs.path }}" \
+          --framework "${{ inputs.framework }}" \
+          --fail-on "${{ inputs.fail-on }}" \
+          --format json > "$RESULTS"
+        SCAN_EXIT=$?
+        set -e
+
+        if [ ! -s "$RESULTS" ]; then
+          echo "::error::HAVOC produced no output. Scan exit code: $SCAN_EXIT"
+          exit 1
         fi
-        ARGS="$ARGS --fail-on ${{ inputs.fail-on }}"
-        ARGS="$ARGS --format json --output /tmp/havoc-results.json"
-        
-        havoc scan $ARGS || true
-        
-        if [ -f /tmp/havoc-results.json ]; then
-          echo "summary=$(cat /tmp/havoc-results.json | jq -c .)" >> $GITHUB_OUTPUT
-          echo "grade=$(cat /tmp/havoc-results.json | jq -r '.grade // "unknown"')" >> $GITHUB_OUTPUT
-          echo "findings-count=$(cat /tmp/havoc-results.json | jq -r '.totalFindings // 0')" >> $GITHUB_OUTPUT
-          echo "critical-count=$(cat /tmp/havoc-results.json | jq -r '.criticalCount // 0')" >> $GITHUB_OUTPUT
+        if ! jq -e . "$RESULTS" >/dev/null 2>&1; then
+          echo "::error::HAVOC output was not valid JSON. Scan exit code: $SCAN_EXIT"
+          exit 1
         fi
 
-    - name: HAVOC Scan Summary
+        echo "results-path=$RESULTS" >> "$GITHUB_OUTPUT"
+
+        # A step output is size-capped, and a large repo's findings array can
+        # exceed it. Over the threshold, publish the result without findings
+        # and point consumers at results-path for the whole document.
+        SUMMARY_LIMIT=524288
+        if [ "$(wc -c < "$RESULTS")" -le "$SUMMARY_LIMIT" ]; then
+          echo "summary=$(jq -c . "$RESULTS")" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Scan result exceeds the step-output limit; the summary output omits findings. Use results-path."
+          echo "summary=$(jq -c 'del(.findings) + {findingsOmitted: (.findings | length)}' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Counts are derived from the findings array, which is what the CLI
+        # emits. There are no totalFindings/criticalCount/highCount keys.
+        echo "grade=$(jq -r '.grade // "unknown"' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        echo "findings-count=$(jq -r '.findings | length' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        echo "critical-count=$(jq -r '[.findings[] | select(.severity == "critical")] | length' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        echo "high-count=$(jq -r '[.findings[] | select(.severity == "high")] | length' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        # authorizationCoverage is the headline: controller actions with a
+        # check. It is null when the scan found no controller actions.
+        # coverage.routeAuthPercent is route-level AUTHENTICATION, a different
+        # question, and is reported separately rather than conflated.
+        echo "authz-coverage-percent=$(jq -r 'if (.authorizationCoverage.totalActions // 0) > 0 then ((.authorizationCoverage.coveredActions * 100 / .authorizationCoverage.totalActions) | floor) else 100 end' "$RESULTS")" >> "$GITHUB_OUTPUT"
+        echo "route-auth-percent=$(jq -r '.coverage.routeAuthPercent // .coverage.coveragePercent // 0' "$RESULTS")" >> "$GITHUB_OUTPUT"
+
+        # Preserve the scan's verdict so fail-on actually fails the build.
+        exit $SCAN_EXIT
+
+    - name: Write job summary
       shell: bash
       if: always()
       run: |
-        echo "## 🔴 HAVOC Security Scan Results" >> $GITHUB_STEP_SUMMARY
-        if [ -f /tmp/havoc-results.json ]; then
-          GRADE=$(cat /tmp/havoc-results.json | jq -r '.grade // "N/A"')
-          TOTAL=$(cat /tmp/havoc-results.json | jq -r '.totalFindings // 0')
-          CRITICAL=$(cat /tmp/havoc-results.json | jq -r '.criticalCount // 0')
-          HIGH=$(cat /tmp/havoc-results.json | jq -r '.highCount // 0')
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Grade | **$GRADE** |" >> $GITHUB_STEP_SUMMARY
-          echo "| Total Findings | $TOTAL |" >> $GITHUB_STEP_SUMMARY
-          echo "| Critical | $CRITICAL |" >> $GITHUB_STEP_SUMMARY
-          echo "| High | $HIGH |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "No results file generated." >> $GITHUB_STEP_SUMMARY
-        fi
+        RESULTS=/tmp/havoc-results.json
+        {
+          echo "## HAVOC Security Scan"
+          if [ -s "$RESULTS" ] && jq -e . "$RESULTS" >/dev/null 2>&1; then
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Grade | **$(jq -r '.grade // "N/A"' "$RESULTS")** |"
+            echo "| Authorization coverage | $(jq -r '.authorizationCoverage.coveredActions // 0' "$RESULTS")/$(jq -r '.authorizationCoverage.totalActions // 0' "$RESULTS") controller actions |"
+            echo "| Route authentication | $(jq -r '.coverage.routeAuthPercent // 0' "$RESULTS")% |"
+            echo "| Total findings | $(jq -r '.findings | length' "$RESULTS") |"
+            echo "| Critical | $(jq -r '[.findings[] | select(.severity == "critical")] | length' "$RESULTS") |"
+            echo "| High | $(jq -r '[.findings[] | select(.severity == "high")] | length' "$RESULTS") |"
+            echo "| Files scanned | $(jq -r '.metadata.filesScanned // 0' "$RESULTS") |"
+            echo "| Duration | $(jq -r '.metadata.durationMs // 0' "$RESULTS")ms |"
+          else
+            echo ""
+            echo "The scan produced no usable output."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
