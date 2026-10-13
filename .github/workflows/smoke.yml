@@ -119,3 +119,104 @@ jobs:
           VERSION=$(echo "$SUMMARY" | jq -r '.metadata.scannerVersion // "missing"')
           [ "$VERSION" != "missing" ] || fail "no scannerVersion in the result"
           echo "pinned case OK — scanner $VERSION"
+
+  injection:
+    name: An input is data, not shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        continue-on-error: true
+        with:
+          # Up to v1.0.2 every input was interpolated into the scan step with
+          # ${{ }}, which the runner substitutes textually, so this ran as the
+          # runner user. The trailing `echo .` even kept the scan working,
+          # which is what made it quiet. Now the CLI receives the string.
+          path: '$(id -un > /tmp/havoc-injection-canary; echo .)'
+
+      - name: Assert nothing executed and the string was treated as a path
+        env:
+          OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # The whole point: the substitution did not run.
+          if [ -e /tmp/havoc-injection-canary ]; then
+            fail "command substitution in 'path' EXECUTED — the input reached a shell as source"
+          fi
+
+          # And it was passed through as a literal path, which does not exist,
+          # so the step must have failed rather than silently scanning '.'.
+          [ "$OUTCOME" = "failure" ] || fail "expected the scan to reject a non-existent path, got '$OUTCOME'"
+
+          echo "injection case OK — the input was data"
+
+  api-key-on-an-older-cli:
+    name: api-key with a CLI that cannot upload still scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        with:
+          path: tests/fixtures/clean
+          # Below 0.5.0 there is no --report-to. Passing it anyway would make
+          # Commander exit with "unknown option" before scanning a single file
+          # — the defect that left v1 reporting nothing for months. The action
+          # must probe, warn, and scan.
+          cli-version: '0.4.1'
+          api-key: 'not-a-real-key'
+
+      - name: Assert the scan ran normally
+        env:
+          GRADE: ${{ steps.scan.outputs.grade }}
+          SUMMARY: ${{ steps.scan.outputs.summary }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          # Reaching this step means the scan exited 0 rather than dying on an
+          # unknown option.
+          [ -n "$GRADE" ] && [ "$GRADE" != "unknown" ] || fail "grade was not set (got '$GRADE')"
+          echo "$SUMMARY" | jq -e '.findings | length >= 0' > /dev/null || fail "summary was not a scan result"
+          echo "older-CLI case OK — warned, scanned, uploaded nothing"
+
+  upload-failure-is-not-fatal:
+    name: A failed upload does not change the verdict
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: clean
+            expected: success
+          - fixture: vulnerable
+            expected: failure
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: scan
+        uses: ./
+        continue-on-error: true
+        with:
+          path: tests/fixtures/${{ matrix.fixture }}
+          cli-version: '0.5.0'
+          api-key: 'not-a-real-key'
+          # Port 9 is discard: the connection is refused immediately. This is
+          # the worst case for an upload and must still be only a warning.
+          cloud-url: 'http://127.0.0.1:9'
+
+      - name: Assert the exit code came from the findings alone
+        env:
+          OUTCOME: ${{ steps.scan.outcome }}
+          EXPECTED: ${{ matrix.expected }}
+          GRADE: ${{ steps.scan.outputs.grade }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$OUTCOME" = "$EXPECTED" ] || fail "upload failure changed the verdict: expected '$EXPECTED', got '$OUTCOME'"
+          [ -n "$GRADE" ] && [ "$GRADE" != "unknown" ] || fail "grade was not set (got '$GRADE')"
+          echo "unreachable-dashboard case OK — verdict '$OUTCOME' decided by the scan"

@@ -1,3 +1,27 @@
+# HAVOC Security Scan — a composite action that installs @havoc-security/cli
+# and scans the checkout on the runner.
+#
+# Inputs reach the shell as environment variables, never through ${{ }}.
+# This is load-bearing, not style: the runner substitutes ${{ }} into a
+# `run:` body TEXTUALLY, before bash parses it, so an input interpolated that
+# way is shell SOURCE rather than data. Quoting does not contain it, because
+# command substitution still runs inside double quotes. Versions up to and
+# including v1.0.2 interpolated `path`, `framework`, `fail-on` and
+# `cli-version`; v1.0.3 passes all of them, and `cloud-url`, through `env:`.
+#
+# Two properties to re-check on every change here, because both are invisible
+# until they are exploited:
+#
+#   1. No `${{ }}` appears in any `run:` body.
+#   2. `cli-version` and `cloud-url` are validated before use. `cli-version`
+#      reaches `npm install` as a package SPEC, where npm also accepts a git
+#      URL or a tarball — so an unchecked value chooses which code runs, not
+#      merely which version of it.
+#
+# .github/workflows/smoke.yml exercises all of this against committed
+# fixtures, including a case asserting that a command substitution in `path`
+# is not executed.
+
 name: 'HAVOC Security Scan'
 description: 'Framework-aware adversarial security scanning for Laravel applications'
 author: 'HAVOC Security'
@@ -7,13 +31,15 @@ branding:
 
 inputs:
   api-key:
-    # RESERVED, NOT YET IMPLEMENTED. Declared so existing workflows that pass it
-    # do not warn, and exported below, but no published CLI reads it: there is
-    # no HAVOC_API_KEY reference and no HTTP client anywhere in
-    # @havoc-security/cli or @havoc-security/scanner (checked in source and in
-    # the published 0.4.1 tarball). The scan is entirely local. Do not advertise
-    # cloud sync until an upload path exists.
-    description: 'RESERVED — not yet implemented. Results are not uploaded anywhere; the scan runs entirely on the runner. Leave unset.'
+    # Needs @havoc-security/cli >= 0.5.0, which is the first version with
+    # `--report-to`. Below that there is no upload path at all, so the step
+    # probes for the flag and warns rather than passing it: an unknown option
+    # makes Commander exit BEFORE the scan, before it reads a single file —
+    # and passing a flag an installed version may not accept is exactly how
+    # that defect happened.
+    #
+    # Left unset, nothing is uploaded and no network request is made.
+    description: 'HAVOC Cloud API key. Create one in your dashboard as a "CI upload only" key — it can upload scans and nothing else. Leave unset to scan without uploading.'
     required: false
   path:
     description: 'Path to scan'
@@ -28,8 +54,8 @@ inputs:
     required: false
     default: 'high'
   cloud-url:
-    # RESERVED — see api-key.
-    description: 'RESERVED — not yet implemented. Has no effect.'
+    # Only consulted when api-key is set.
+    description: 'HAVOC Cloud instance to upload to. Only used when api-key is set.'
     required: false
     default: 'https://havoc.cloud'
   cli-version:
@@ -73,24 +99,79 @@ runs:
 
     - name: Install HAVOC CLI
       shell: bash
-      run: npm install -g "@havoc-security/cli@${{ inputs.cli-version }}"
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        # Through the environment, never interpolated into this script — see
+        # the note on the scan step. Validated as well, because this value
+        # reaches `npm install` as a package SPEC: npm accepts a git URL or a
+        # tarball there, so an unchecked value chooses which code runs, not
+        # merely which version.
+        if ! printf '%s' "$CLI_VERSION" | grep -Eq '^([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?|latest|next|beta)$'; then
+          echo "::error::cli-version must be an exact version like 1.2.3, or latest/next/beta. Got: $CLI_VERSION"
+          exit 1
+        fi
+        npm install -g "@havoc-security/cli@$CLI_VERSION"
 
     - name: Run HAVOC scan
       id: scan
       shell: bash
       env:
+        # The key reaches the CLI through the environment, never the command
+        # line: an argument is visible in `ps` and in any `set -x` trace, and
+        # a composite action cannot promise neither will happen in the job
+        # around it.
         HAVOC_API_KEY: ${{ inputs.api-key }}
-        HAVOC_CLOUD_URL: ${{ inputs.cloud-url }}
+        # EVERY input comes through here, and none is interpolated into the
+        # script below.
+        #
+        # `${{ }}` in a `run:` body is substituted TEXTUALLY before bash sees
+        # it, so an input is shell SOURCE rather than data — and double quotes
+        # do not help, because command substitution still runs inside them.
+        # This step is the one that must not get it wrong: the API key is in
+        # scope right here, so anything executing in this shell can read it.
+        #
+        # An environment variable is passed by the runner as data and expanded
+        # by bash as a value. Four of these were interpolated in v1.0.2 and
+        # earlier.
+        SCAN_PATH: ${{ inputs.path }}
+        FRAMEWORK: ${{ inputs.framework }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        CLOUD_URL: ${{ inputs.cloud-url }}
       run: |
         set -o pipefail
         RESULTS=/tmp/havoc-results.json
 
+        # Upload only when a key was given, and only when the installed CLI
+        # can actually do it. `--report-to` landed in 0.5.0; passing it to an
+        # older one makes Commander exit with "unknown option" BEFORE the scan
+        # runs, rather than scanning without uploading. `cli-version` defaults
+        # to `latest` but a workflow may pin anything, so the capability is
+        # probed rather than assumed.
+        REPORT_ARGS=()
+        if [ -n "${HAVOC_API_KEY:-}" ]; then
+          if ! printf '%s' "$CLOUD_URL" | grep -Eq '^https?://[^[:space:]]+$'; then
+            echo "::error::cloud-url must be an http(s) URL. Got: $CLOUD_URL"
+            exit 1
+          fi
+          if havoc scan --help 2>/dev/null | grep -q -- '--report-to'; then
+            REPORT_ARGS=(--report-to "$CLOUD_URL")
+          else
+            echo "::warning::api-key was provided but the installed HAVOC CLI has no --report-to, so the result was not uploaded. Pin cli-version to 0.5.0 or later. The scan itself ran normally."
+          fi
+        fi
+
         # The CLI writes JSON to stdout and diagnostics to stderr. There is no
         # --output flag; passing one makes Commander exit before it scans.
+        #
+        # An upload fault cannot change SCAN_EXIT: the CLI decides its exit
+        # code from the findings alone and reports an upload failure as a
+        # warning on stderr, so a dashboard being down never fails a build.
         set +e
-        havoc scan "${{ inputs.path }}" \
-          --framework "${{ inputs.framework }}" \
-          --fail-on "${{ inputs.fail-on }}" \
+        havoc scan "$SCAN_PATH" \
+          --framework "$FRAMEWORK" \
+          --fail-on "$FAIL_ON" \
+          "${REPORT_ARGS[@]}" \
           --format json > "$RESULTS"
         SCAN_EXIT=$?
         set -e
